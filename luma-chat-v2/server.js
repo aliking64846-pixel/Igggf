@@ -1,0 +1,31 @@
+const express=require("express"),http=require("http"),path=require("path"),fs=require("fs"),crypto=require("crypto"),bcrypt=require("bcryptjs"),jwt=require("jsonwebtoken");
+const {Server}=require("socket.io");
+const app=express(),server=http.createServer(app),io=new Server(server,{maxHttpBufferSize:10*1024*1024});
+const PORT=process.env.PORT||3000,SECRET=process.env.JWT_SECRET;
+if(!SECRET||SECRET.length<32) throw new Error("Set JWT_SECRET to a random secret of at least 32 characters");
+const FILE=path.join(__dirname,"data.json");
+app.use(express.json({limit:"1mb"}));app.use(express.static(path.join(__dirname,"public")));
+let db;try{db=JSON.parse(fs.readFileSync(FILE))}catch{db={users:[],friends:[],requests:[],blocks:[]}}
+function save(){const t=FILE+".tmp";fs.writeFileSync(t,JSON.stringify(db));fs.renameSync(t,FILE)}
+const pair=(a,b)=>[a,b].sort().join(":");
+const friend=(a,b)=>db.friends.includes(pair(a,b));
+const blocked=(a,b)=>db.blocks.some(x=>(x.by===a&&x.target===b)||(x.by===b&&x.target===a));
+const safe=u=>({id:u.id,username:u.username});
+const auth=(req,res,next)=>{try{req.user=jwt.verify((req.headers.authorization||"").replace(/^Bearer /,""),SECRET);next()}catch{res.status(401).json({error:"يلزم تسجيل الدخول"})}};
+const nameOk=s=>typeof s==="string"&&/^[a-zA-Z0-9_]{3,20}$/.test(s);
+app.post("/api/register",async(req,res)=>{let {username,password}=req.body||{};if(!nameOk(username)||typeof password!=="string"||password.length<8)return res.status(400).json({error:"اسم المستخدم 3-20 حرفاً وكلمة المرور 8 أحرف على الأقل"});if(db.users.some(u=>u.username.toLowerCase()===username.toLowerCase()))return res.status(409).json({error:"اسم المستخدم محجوز"});let u={id:crypto.randomUUID(),username,passwordHash:await bcrypt.hash(password,12)};db.users.push(u);save();res.json({token:jwt.sign({id:u.id,username:u.username},SECRET,{expiresIn:"7d"}),user:safe(u)})});
+app.post("/api/login",async(req,res)=>{let u=db.users.find(x=>x.username.toLowerCase()===String(req.body.username||"").toLowerCase());if(!u||!await bcrypt.compare(String(req.body.password||""),u.passwordHash))return res.status(401).json({error:"بيانات الدخول غير صحيحة"});res.json({token:jwt.sign({id:u.id,username:u.username},SECRET,{expiresIn:"7d"}),user:safe(u)})});
+app.get("/api/me",auth,(req,res)=>{let u=db.users.find(x=>x.id===req.user.id);if(!u)return res.sendStatus(404);res.json({user:safe(u)})});
+app.get("/api/users",auth,(req,res)=>{let q=String(req.query.q||"").toLowerCase();res.json({users:db.users.filter(u=>u.id!==req.user.id&&u.username.toLowerCase().includes(q)&&!blocked(req.user.id,u.id)).slice(0,40).map(safe)})});
+app.get("/api/friends",auth,(req,res)=>{let ids=db.friends.filter(k=>k.split(":").includes(req.user.id)).map(k=>k.split(":").find(x=>x!==req.user.id));res.json({friends:db.users.filter(u=>ids.includes(u.id)).map(safe)})});
+app.get("/api/requests",auth,(req,res)=>res.json({incoming:db.requests.filter(x=>x.to===req.user.id).map(x=>({...x,user:safe(db.users.find(u=>u.id===x.from))})),outgoing:db.requests.filter(x=>x.from===req.user.id)}));
+app.post("/api/requests/:id",auth,(req,res)=>{let to=db.users.find(u=>u.id===req.params.id),from=req.user.id;if(!to||to.id===from||blocked(from,to.id)||friend(from,to.id)||db.requests.some(x=>(x.from===from&&x.to===to.id)||(x.from===to.id&&x.to===from)))return res.status(409).json({error:"لا يمكن إرسال الطلب"});db.requests.push({id:crypto.randomUUID(),from,to:to.id});save();res.json({ok:true})});
+app.post("/api/requests/:id/accept",auth,(req,res)=>{let r=db.requests.find(x=>x.id===req.params.id&&x.to===req.user.id);if(!r)return res.sendStatus(404);db.requests=db.requests.filter(x=>x.id!==r.id);db.friends.push(pair(r.from,r.to));save();res.json({ok:true})});
+app.post("/api/block/:id",auth,(req,res)=>{let id=req.params.id;if(!db.blocks.some(x=>x.by===req.user.id&&x.target===id))db.blocks.push({by:req.user.id,target:id});db.friends=db.friends.filter(k=>!k.split(":").includes(req.user.id)||!k.split(":").includes(id));db.requests=db.requests.filter(x=>!([x.from,x.to].includes(req.user.id)&&[x.from,x.to].includes(id)));save();res.json({ok:true})});
+const online=new Map();io.use((s,n)=>{try{s.user=jwt.verify(s.handshake.auth.token,SECRET);n()}catch{n(new Error("unauthorized"))}});
+io.on("connection",s=>{let id=s.user.id;s.join(id);online.set(id,(online.get(id)||0)+1);io.emit("presence",{id,online:true});
+s.on("private-message",p=>{if(!p||!friend(id,p.to)||blocked(id,p.to)||!p.message||!["text","image","video"].includes(p.message.type))return;let m=p.message;if(m.type==="text"&&(typeof m.text!=="string"||m.text.length>5000))return;if(m.type!=="text"&&(typeof m.data!=="string"||m.data.length>8*1024*1024))return;let packet={id:p.id,from:id,to:p.to,message:m,at:Date.now()};io.to(p.to).emit("private-message",packet);s.emit("message-sent",{id:p.id,at:packet.at})});
+s.on("typing",p=>{if(p&&friend(id,p.to)&&!blocked(id,p.to))io.to(p.to).emit("typing",{from:id,typing:!!p.typing})});
+s.on("read",p=>{if(p&&friend(id,p.to)&&!blocked(id,p.to))io.to(p.to).emit("read",{from:id,ids:Array.isArray(p.ids)?p.ids.slice(0,100):[]})});
+s.on("disconnect",()=>{let n=(online.get(id)||1)-1;if(n<=0){online.delete(id);io.emit("presence",{id,online:false})}else online.set(id,n)})});
+server.listen(PORT,()=>console.log("Luma Chat V2 listening on "+PORT));
